@@ -12,7 +12,7 @@ PROXY_AUTO_UPDATE_IP = True  # Автоматически обновлять IP 
 
 # Настройки Telegram
 TELEGRAM_ENABLED = True
-TELEGRAM_BOT_TOKEN = "8300878628:AAFe4N9HqfrZWt7ncdJZCSlGQbFjoUXAr7U"
+TELEGRAM_BOT_TOKEN = "8562662254:AAFqMiPjX4RU-aeA0IPW2OU4HIn1h4NEPIU"
 TELEGRAM_CHAT_ID = "-1002234810541"
 TELEGRAM_THREAD_ID = 728886
 
@@ -84,7 +84,7 @@ FIRST_PAGE_SKIP_OWNERS = 6
 # Дневные лимиты
 MAX_DAILY_DONATIONS = 50
 MAX_DAILY_REPLACEMENTS = 10
-MAX_CLUB_CARD_OWNERS = 50
+MAX_CLUB_CARD_OWNERS = 100  # 🔧 ИЗМЕНЕНО: было 50, стало 100
 
 # 🔧 НОВОЕ: Часовой пояс (MSK = UTC+3)
 TIMEZONE_OFFSET = 3  # Московское время UTC+3
@@ -100,4 +100,4 @@ OUTPUT_DIR = "created_files"
 INVENTORY_FILE = "inventory.json"
 PARSED_INVENTORY_FILE = "parsed_inventory.json"
 BOOST_CARD_FILE = "boost_card.json"
-SENT_CARDS_FILE = "sent_cards.json"  
+SENT_CARDS_FILE = "sent_cards.json"
