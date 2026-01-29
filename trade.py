@@ -373,7 +373,6 @@ class TradeManager:
         partner_id: int,
         card_id: int
     ) -> Optional[int]:
-        """Поиск instance_id с правильным offset."""
         self._log(f"🔍 Поиск instance_id карты {card_id} у владельца {partner_id}...")
         
         try:
@@ -391,63 +390,172 @@ class TradeManager:
                 headers["X-CSRF-TOKEN"] = csrf_token
             
             offset = 0
-            max_batches = 100
+            max_batches = 10  # Максимум 10 диапазонов (ID 0-99999)
+            min_batches = 3   # Минимум 3 диапазона даже если первые пустые
             batch_count = 0
+            
+            MAX_TIMEOUT_RETRIES = 3  # Попытки при таймауте
             
             while batch_count < max_batches:
                 self.limiter.wait_and_record()
                 
-                self._log(f"  Проверка батча offset={offset}")
+                self._log(f"  📦 Диапазон #{batch_count + 1}: offset={offset} (ID {offset}-{offset+9999})")
                 
-                response = self.session.post(
-                    url,
-                    data={"offset": offset},
-                    headers=headers,
-                    timeout=REQUEST_TIMEOUT
-                )
+                # 🔧 НОВОЕ: Обработка таймаутов с повторными попытками
+                response = None
+                last_error = None
                 
+                for timeout_retry in range(MAX_TIMEOUT_RETRIES):
+                    try:
+                        response = self.session.post(
+                            url,
+                            data={"offset": offset},
+                            headers=headers,
+                            timeout=REQUEST_TIMEOUT
+                        )
+                        # Успех - выходим из retry цикла
+                        break
+                        
+                    except requests.Timeout as e:
+                        last_error = e
+                        self._log(f"     ⏱️  Таймаут (попытка {timeout_retry + 1}/{MAX_TIMEOUT_RETRIES})")
+                        
+                        if timeout_retry < MAX_TIMEOUT_RETRIES - 1:
+                            # Пауза перед повтором
+                            time.sleep(2)
+                            continue
+                        else:
+                            # Все попытки исчерпаны
+                            self._log(f"     ❌ Все {MAX_TIMEOUT_RETRIES} попытки исчерпаны для offset={offset}")
+                            response = None
+                            break
+                    
+                    except requests.RequestException as e:
+                        last_error = e
+                        self._log(f"     ⚠️  Ошибка сети: {e}")
+                        if timeout_retry < MAX_TIMEOUT_RETRIES - 1:
+                            time.sleep(2)
+                            continue
+                        else:
+                            response = None
+                            break
+                
+                # Если не получили ответ после всех попыток - пробуем следующий диапазон
+                if response is None:
+                    self._log(f"     ⏭️  Пропускаем диапазон, переходим к следующему")
+                    offset += CARDS_PER_BATCH
+                    batch_count += 1
+                    continue
+                
+                # Проверяем статус ответа
                 if response.status_code == 429:
-                    self._log("⚠️  Rate limit 429")
+                    self._log("     ⚠️  Rate limit 429")
                     self.limiter.pause_for_429()
                     continue
                 
                 if response.status_code != 200:
-                    self._log(f"Ошибка API: {response.status_code}")
-                    break
+                    self._log(f"     ❌ Ошибка API: {response.status_code}")
+                    # Не прерываемся - пробуем следующий диапазон
+                    offset += CARDS_PER_BATCH
+                    batch_count += 1
+                    continue
                 
-                data = response.json()
+                # Парсим JSON
+                try:
+                    data = response.json()
+                except ValueError as e:
+                    self._log(f"     ❌ Не удалось распарсить JSON: {e}")
+                    offset += CARDS_PER_BATCH
+                    batch_count += 1
+                    continue
+                
                 cards = data.get("cards", [])
                 
+                # Диапазон пустой
                 if not cards:
-                    self._log(f"  Батч пуст, карта не найдена")
-                    break
+                    self._log(f"     📭 Диапазон пуст (нет карт)")
+                    
+                    # 🔧 НОВОЕ: Проверяем минимум диапазонов даже если пусто
+                    if batch_count >= min_batches - 1:
+                        self._log(f"     🛑 Проверено минимум {min_batches} диапазонов, останавливаемся")
+                        break
+                    
+                    # Иначе продолжаем проверку следующих диапазонов
+                    offset += CARDS_PER_BATCH
+                    batch_count += 1
+                    continue
                 
+                self._log(f"     📊 Получено {len(cards)} карт в этом диапазоне")
+                
+                # Ищем нужную карту в этом диапазоне
                 for card in cards:
-                    c_card_id = card.get("card_id")
+                    c_card_id = None
                     
-                    if isinstance(card.get("card"), dict):
-                        c_card_id = card["card"].get("id") or c_card_id
+                    # Способ 1: card_id напрямую в объекте
+                    if card.get("card_id"):
+                        c_card_id = card.get("card_id")
                     
+                    # Способ 2: card_id внутри вложенного объекта "card"
+                    elif isinstance(card.get("card"), dict):
+                        nested = card.get("card")
+                        c_card_id = nested.get("id") or nested.get("card_id")
+                    
+                    # Проверяем совпадение ID
                     if c_card_id and int(c_card_id) == card_id:
                         instance_id = card.get("id")
-                        if instance_id:
-                            self._log(f"✅ Найден instance_id={instance_id}")
-                            return int(instance_id)
+                        
+                        if not instance_id:
+                            self._log(f"     ⚠️  Карта {card_id} найдена, но отсутствует instance_id")
+                            continue
+                        
+                        # 🔧 НОВОЕ: Проверяем доступность карты
+                        # Карта может быть locked или уже в другом обмене
+                        is_locked = (
+                            card.get("locked", False) or 
+                            card.get("is_locked", False) or
+                            card.get("lock", False)
+                        )
+                        
+                        is_in_trade = (
+                            card.get("in_trade", False) or 
+                            card.get("is_in_trade", False) or
+                            card.get("trading", False)
+                        )
+                        
+                        if is_locked or is_in_trade:
+                            self._log(
+                                f"     ⚠️  Карта {card_id} (instance {instance_id}) найдена, "
+                                f"но недоступна (locked={is_locked}, in_trade={is_in_trade})"
+                            )
+                            # Продолжаем искать - может быть несколько экземпляров
+                            continue
+                        
+                        # Найдена доступная карта!
+                        card_name = card.get("name", "Unknown")
+                        self._log(f"     ✅ НАЙДЕНО! card_id={card_id}, instance_id={instance_id}, name='{card_name}'")
+                        self._log(f"     📍 Диапазон #{batch_count + 1}, offset={offset}")
+                        return int(instance_id)
                 
-                if len(cards) < 60:
-                    self._log(f"  Последний батч, карта не найдена")
-                    break
-                
+                # В этом диапазоне не нашли - переходим к следующему
                 offset += CARDS_PER_BATCH
                 batch_count += 1
                 
+                # Небольшая задержка между диапазонами
                 time.sleep(CARD_API_DELAY)
             
-            self._log(f"❌ Instance_id не найден (проверено батчей: {batch_count})")
+            # Не нашли после проверки всех диапазонов
+            self._log(f"❌ Карта {card_id} НЕ найдена после проверки {batch_count} диапазонов")
+            self._log(f"   Возможные причины:")
+            self._log(f"   1. У владельца нет этой карты")
+            self._log(f"   2. Все экземпляры карты заблокированы/в обменах")
+            self._log(f"   3. Карта в диапазоне ID > {offset}")
             return None
             
         except Exception as e:
-            self._log(f"Ошибка поиска: {e}")
+            self._log(f"❌ Критическая ошибка при поиске карты: {e}")
+            if self.debug:
+                import traceback
+                traceback.print_exc()
             return None
     
     def create_trade_direct_api(
