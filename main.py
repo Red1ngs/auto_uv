@@ -21,7 +21,7 @@ from config import (
     TELEGRAM_CHAT_ID,
     TELEGRAM_THREAD_ID
 )
-from auth import login
+from auth import login, is_authenticated
 from inventory import get_user_inventory, InventoryManager
 from boost import get_boost_card_info
 from card_selector import select_trade_card
@@ -53,10 +53,11 @@ from utils import (
 
 class MangaBuffApp:
     """
-    Главное приложение MangaBuff v2.6 - добавлена валидация клуба.
+    Главное приложение MangaBuff v2.7 - добавлено автоматическое переподключение.
     """
     
     MAX_FAILED_CYCLES = 3
+    MAX_RECONNECT_ATTEMPTS = 3  # 🔧 НОВОЕ: Максимум попыток переподключения
     
     def __init__(self, args: argparse.Namespace):
         self.args = args
@@ -74,6 +75,146 @@ class MangaBuffApp:
         self.replace_requested = False
         self.failed_cycles_count = 0
     
+    def _perform_login(self) -> bool:
+        """🔧 НОВОЕ: Выполняет авторизацию с повторными попытками."""
+        print("\n🔐 Вход в аккаунт...")
+        logger.info("Попытка авторизации")
+        
+        self.session = login(
+            self.args.email,
+            self.args.password,
+            self.proxy_manager
+        )
+        
+        if not self.session:
+            print_error("Ошибка авторизации")
+            logger.error("Авторизация не удалась")
+            return False
+        
+        print_success("Авторизация успешна\n")
+        logger.info("Авторизация успешна")
+        return True
+    
+    def _check_session_valid(self) -> bool:
+        """🔧 НОВОЕ: Проверяет валидность текущей сессии."""
+        if not self.session:
+            logger.warning("Сессия отсутствует")
+            return False
+        
+        if not is_authenticated(self.session):
+            logger.warning("Сессия не авторизована (куки истекли)")
+            return False
+        
+        return True
+    
+    def _reconnect(self, reason: str = "Переподключение") -> bool:
+        """
+        🔧 НОВОЕ: Переподключается к сервису с обновлением всех компонентов.
+        
+        Args:
+            reason: Причина переподключения
+        
+        Returns:
+            True если успешно
+        """
+        print_warning(f"\n⚠️  {reason}")
+        logger.warning(f"{reason} - начало процедуры переподключения")
+        
+        for attempt in range(1, self.MAX_RECONNECT_ATTEMPTS + 1):
+            print(f"\n🔄 Попытка переподключения {attempt}/{self.MAX_RECONNECT_ATTEMPTS}...")
+            logger.info(f"Попытка переподключения {attempt}/{self.MAX_RECONNECT_ATTEMPTS}")
+            
+            # Пауза перед повторной попыткой
+            if attempt > 1:
+                wait_time = 5 * attempt
+                print(f"⏳ Ожидание {wait_time}с перед повторной попыткой...")
+                time.sleep(wait_time)
+            
+            # Выполняем авторизацию
+            if not self._perform_login():
+                logger.error(f"Попытка {attempt} не удалась")
+                continue
+            
+            # Обновляем session в БД для парсинга nicknames
+            try:
+                from telegram_users_db import get_users_db
+                users_db = get_users_db()
+                users_db.set_session(self.session)
+                logger.info("✅ Session обновлена в БД")
+            except Exception as e:
+                logger.warning(f"Не удалось обновить session в БД: {e}")
+            
+            # Обновляем session в Google Sheets parser
+            try:
+                from google_sheets_parser import get_sheets_parser
+                sheets_parser = get_sheets_parser()
+                sheets_parser.set_session(self.session)
+                logger.info("✅ Session обновлена в Google Sheets parser")
+            except Exception as e:
+                logger.warning(f"Не удалось обновить session в Google Sheets: {e}")
+            
+            # Обновляем stats_manager
+            if self.stats_manager and self.args.boost_url:
+                self.stats_manager = create_stats_manager(
+                    self.session,
+                    self.args.boost_url
+                )
+                logger.info("✅ Stats manager обновлен")
+            
+            # Обновляем processor если был создан
+            if self.processor:
+                self.processor.session = self.session
+                self.processor.parser.session = self.session
+                if self.processor.trade_manager:
+                    self.processor.trade_manager.session = self.session
+                logger.info("✅ Processor обновлен")
+            
+            # Обновляем history_monitor
+            if self.history_monitor:
+                self.history_monitor.session = self.session
+                logger.info("✅ History monitor обновлен")
+            
+            # Обновляем monitor
+            if self.monitor:
+                self.monitor.session = self.session
+                if self.monitor.trade_manager:
+                    self.monitor.trade_manager.session = self.session
+                logger.info("✅ Monitor обновлен")
+            
+            # Обновляем validator в unified handler
+            if self.telegram_unified_handler and self.telegram_unified_handler.validator:
+                self.telegram_unified_handler.validator.session = self.session
+                logger.info("✅ Validator обновлен")
+            
+            print_success(f"✅ Переподключение успешно (попытка {attempt})")
+            logger.info(f"Переподключение успешно после {attempt} попыток")
+            return True
+        
+        print_error(f"❌ Все {self.MAX_RECONNECT_ATTEMPTS} попытки переподключения исчерпаны")
+        logger.error(f"Все {self.MAX_RECONNECT_ATTEMPTS} попытки переподключения исчерпаны")
+        return False
+    
+    def _handle_network_error(self, error_context: str) -> bool:
+        """
+        🔧 НОВОЕ: Обрабатывает сетевые ошибки с переподключением.
+        
+        Args:
+            error_context: Контекст ошибки (для логирования)
+        
+        Returns:
+            True если переподключение успешно
+        """
+        logger.error(f"Сетевая ошибка в контексте: {error_context}")
+        
+        # Проверяем сессию
+        if not self._check_session_valid():
+            return self._reconnect(f"Сессия истекла ({error_context})")
+        
+        # Если сессия валидна - просто пауза
+        print_warning("⚠️  Сетевая ошибка, пауза 5 секунд...")
+        time.sleep(5)
+        return True
+    
     def setup(self) -> bool:
         ensure_dir_exists(self.output_dir)
         
@@ -85,18 +226,9 @@ class MangaBuffApp:
         
         print(f"⏱️  Rate Limiting: {self.rate_limiter.max_requests} req/min")
         
-        print("\n🔐 Вход в аккаунт...")
-        self.session = login(
-            self.args.email,
-            self.args.password,
-            self.proxy_manager
-        )
-        
-        if not self.session:
-            print_error("Ошибка авторизации")
+        # 🔧 ИСПРАВЛЕНО: Используем новую функцию авторизации
+        if not self._perform_login():
             return False
-        
-        print_success("Авторизация успешна\n")
         
         # 🔧 НОВОЕ: Устанавливаем session в БД для парсинга nicknames
         from telegram_users_db import get_users_db
@@ -120,8 +252,8 @@ class MangaBuffApp:
                 thread_id=thread_id_val,
                 on_replace_triggered=on_replace_triggered,
                 proxy_manager=self.proxy_manager,
-                boost_url=self.args.boost_url,  # 🔧 НОВОЕ: Передаем boost_url
-                session=self.session  # 🔧 НОВОЕ: Передаем session
+                boost_url=self.args.boost_url,
+                session=self.session
             )
             print("🤖 Telegram бот запущен (команды + мониторинг + валидация)\n")
         
@@ -179,7 +311,20 @@ class MangaBuffApp:
             return []
         
         print(f"📦 Загрузка инвентаря пользователя {self.args.user_id}...")
-        inventory = get_user_inventory(self.session, self.args.user_id)
+        
+        # 🔧 НОВОЕ: Обработка ошибок загрузки инвентаря
+        try:
+            inventory = get_user_inventory(self.session, self.args.user_id)
+        except Exception as e:
+            logger.error(f"Ошибка загрузки инвентаря: {e}")
+            if not self._handle_network_error("load_inventory"):
+                return None
+            # Повторная попытка после переподключения
+            try:
+                inventory = get_user_inventory(self.session, self.args.user_id)
+            except Exception as e2:
+                logger.error(f"Повторная ошибка загрузки инвентаря: {e2}")
+                return []
         
         print_success(f"Всего загружено: {len(inventory)} карточек")
         
@@ -198,7 +343,19 @@ class MangaBuffApp:
         if not self.args.boost_url:
             return None
         
-        boost_card = get_boost_card_info(self.session, self.args.boost_url)
+        # 🔧 НОВОЕ: Обработка ошибок загрузки карты
+        try:
+            boost_card = get_boost_card_info(self.session, self.args.boost_url)
+        except Exception as e:
+            logger.error(f"Ошибка загрузки boost card: {e}")
+            if not self._handle_network_error("load_boost_card"):
+                return None
+            # Повторная попытка
+            try:
+                boost_card = get_boost_card_info(self.session, self.args.boost_url)
+            except Exception as e2:
+                logger.error(f"Повторная ошибка загрузки boost card: {e2}")
+                return None
         
         if not boost_card:
             print_error("Не удалось получить карту для буста")
@@ -290,16 +447,7 @@ class MangaBuffApp:
     
     def enter_wait_mode(self, current_boost_card: dict) -> None:
         """
-        🔧 ИСПРАВЛЕНО: Режим ожидания без спама логами.
-        
-        Только:
-        1. Проверяет лимиты раз в 30 секунд
-        2. Мониторинг работает (легковесная проверка card_id)
-        3. Telegram бот активен
-        4. История обменов обновляется
-        
-        Args:
-            current_boost_card: Текущая карта для обработки команд замены
+        🔧 ИСПРАВЛЕНО: Режим ожидания с проверкой сессии.
         """
         # Отменяем все обмены ПЕРЕД входом в режим ожидания
         if not self.args.dry_run and self.processor and self.processor.trade_manager:
@@ -328,31 +476,50 @@ class MangaBuffApp:
         
         check_count = 0
         last_stats_time = time.time()
+        last_session_check = time.time()
+        SESSION_CHECK_INTERVAL = 300  # Проверяем сессию каждые 5 минут
         
         while True:
             check_count += 1
             
+            # 🔧 НОВОЕ: Периодическая проверка сессии
+            current_time = time.time()
+            if current_time - last_session_check >= SESSION_CHECK_INTERVAL:
+                logger.debug("Проверка валидности сессии в режиме ожидания")
+                if not self._check_session_valid():
+                    print_warning("\n⚠️  Сессия истекла в режиме ожидания!")
+                    if not self._reconnect("Сессия истекла"):
+                        print_error("❌ Не удалось переподключиться")
+                        return
+                last_session_check = current_time
+            
             # 🔧 КРИТИЧНО: Проверяем только можем ли вкладывать
-            if self.stats_manager.can_donate(force_refresh=True):
+            try:
+                can_donate = self.stats_manager.can_donate(force_refresh=True)
+            except Exception as e:
+                logger.error(f"Ошибка проверки лимитов: {e}")
+                if not self._handle_network_error("wait_mode_check_limits"):
+                    return
+                continue
+            
+            if can_donate:
                 print_success("\n✅ Лимит вкладов обновился! Возобновляем работу...")
                 self.stats_manager.print_stats()
                 return
             
             # Вывод статистики раз в 5 минут
-            current_time = time.time()
             if current_time - last_stats_time >= WAIT_MODE_STATS_INTERVAL:
                 print_section("📊 РЕЖИМ ОЖИДАНИЯ - Статистика", char="-")
                 self.stats_manager.print_stats()
                 last_stats_time = current_time
             
-            # 🔧 ИСПРАВЛЕНО: Проверка смены карты через монитор (легковесная)
-            # Мониторинг работает в фоне и сам проверяет card_id каждые 2 секунды
+            # Проверка смены карты через монитор (легковесная)
             if self.monitor and self.monitor.card_changed:
                 logger.info("ℹ️  Карта в клубе изменилась (режим ожидания)")
                 print_info("ℹ️  Карта в клубе изменилась (режим ожидания)")
                 self.monitor.card_changed = False
                 
-                # 🔧 НОВОЕ: Обновляем текущую карту
+                # Обновляем текущую карту
                 current_boost_card = self._load_current_boost_card(current_boost_card)
             
             # Проверка команды замены из Telegram
@@ -371,7 +538,6 @@ class MangaBuffApp:
                 else:
                     print_warning("⚠️  Замена не удалась, продолжаем ожидание")
             
-            # 🔧 ИСПРАВЛЕНО: Только одна строка в логах
             if check_count % 10 == 0:
                 logger.debug(f"Режим ожидания: проверка #{check_count}")
             
@@ -403,8 +569,23 @@ class MangaBuffApp:
         self.init_processor()
         
         while True:
+            # 🔧 НОВОЕ: Проверка сессии перед началом цикла
+            if not self._check_session_valid():
+                print_warning("\n⚠️  Сессия истекла перед началом цикла!")
+                if not self._reconnect("Сессия истекла"):
+                    print_error("❌ Критическая ошибка: не удалось переподключиться")
+                    return
+            
             # 🔧 ИСПРАВЛЕНО: Проверяем лимит вкладов
-            if not self.stats_manager.can_donate(force_refresh=True):
+            try:
+                can_donate = self.stats_manager.can_donate(force_refresh=True)
+            except Exception as e:
+                logger.error(f"Ошибка проверки лимитов: {e}")
+                if not self._handle_network_error("processing_check_limits"):
+                    return
+                continue
+            
+            if not can_donate:
                 print_warning("\n⛔ Лимит вкладов достигнут!")
                 current_boost_card = self._load_current_boost_card(boost_card)
                 self.enter_wait_mode(current_boost_card)
@@ -490,7 +671,15 @@ class MangaBuffApp:
             print(f"📊 Текущий rate: {current_rate}/{self.rate_limiter.max_requests} req/min\n")
             
             # 🔧 ЕЩЕ РАЗ проверяем лимит перед обработкой
-            if not self.stats_manager.can_donate(force_refresh=True):
+            try:
+                can_donate = self.stats_manager.can_donate(force_refresh=True)
+            except Exception as e:
+                logger.error(f"Ошибка проверки лимитов перед обработкой: {e}")
+                if not self._handle_network_error("before_processing"):
+                    return
+                continue
+            
+            if not can_donate:
                 print_warning("⛔ Лимит вкладов достигнут!")
                 self.enter_wait_mode(current_boost_card)
                 continue
@@ -527,18 +716,26 @@ class MangaBuffApp:
                 else:
                     print_info("ℹ️  Замена не удалась, продолжаем")
             
-            total = process_owners_page_by_page(
-                session=self.session,
-                card_id=str(current_card_id),
-                boost_card=current_boost_card,
-                output_dir=self.output_dir,
-                select_card_func=select_trade_card,
-                send_trade_func=send_trade_to_owner,
-                monitor_obj=self.monitor,
-                processor=self.processor,
-                dry_run=self.args.dry_run,
-                debug=self.args.debug
-            )
+            # 🔧 НОВОЕ: Обработка владельцев с обработкой ошибок
+            try:
+                total = process_owners_page_by_page(
+                    session=self.session,
+                    card_id=str(current_card_id),
+                    boost_card=current_boost_card,
+                    output_dir=self.output_dir,
+                    select_card_func=select_trade_card,
+                    send_trade_func=send_trade_to_owner,
+                    monitor_obj=self.monitor,
+                    processor=self.processor,
+                    dry_run=self.args.dry_run,
+                    debug=self.args.debug
+                )
+            except Exception as e:
+                logger.error(f"Критическая ошибка обработки владельцев: {e}")
+                if not self._handle_network_error("process_owners"):
+                    return
+                # Пропускаем этот цикл и начинаем заново
+                continue
             
             if total > 0:
                 print_success(f"Обработано {total} владельцев")
@@ -696,7 +893,7 @@ class MangaBuffApp:
 
 def create_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="MangaBuff v2.6 - добавлена валидация клуба"
+        description="MangaBuff v2.7 - автоматическое переподключение"
     )
     
     parser.add_argument("--email", required=True, help="Email")
@@ -731,7 +928,7 @@ def main():
     )
     
     main_logger.section("ЗАПУСК ПРИЛОЖЕНИЯ MANGABUFF", char="=")
-    main_logger.info("Версия: 2.6 (добавлена валидация клуба)")
+    main_logger.info("Версия: 2.7 (автоматическое переподключение)")
     main_logger.info(f"Время запуска: {time.strftime('%Y-%m-%d %H:%M:%S')}")
     
     parser = create_argument_parser()
